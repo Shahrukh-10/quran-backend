@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin — Quran Backend</title>
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 1200px; }
+        h1 { margin-bottom: 0.5rem; }
+        .badge { display: inline-block; padding: 0.2em 0.6em; border-radius: 4px; font-size: 0.85em; font-weight: 600; }
+        .badge-ok { background: #d1fae5; color: #065f46; }
+        .badge-fail { background: #fee2e2; color: #991b1b; }
+        .badge-never { background: #f3f4f6; color: #4b5563; }
+        table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+        th, td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid #e5e7eb; }
+        th { background: #f9fafb; font-weight: 600; }
+        .counts { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 0.75rem; margin-top: 1rem; }
+        .count-card { background: #f9fafb; padding: 1rem; border-radius: 8px; }
+        .count-card .label { font-size: 0.85em; color: #6b7280; }
+        .count-card .value { font-size: 1.5em; font-weight: 700; }
+        button { background: #059669; color: white; padding: 0.5em 1em; border: 0; border-radius: 4px; cursor: pointer; font-size: 0.9em; }
+        pre { background: #f3f4f6; padding: 1rem; border-radius: 4px; overflow-x: auto; font-size: 0.85em; }
+    </style>
+</head>
+<body>
+    <h1>Quran Backend Admin</h1>
+    <p>App time: <span th:text="${appTime}">-</span></p>
+
+    <h2>Data counts</h2>
+    <div class="counts">
+        <div class="count-card" th:each="c : ${counts}">
+            <div class="label" th:text="${c.key}">-</div>
+            <div class="value" th:text="${c.value}">0</div>
+        </div>
+    </div>
+
+    <h2>Sync state (Spring)</h2>
+    <form th:action="@{/admin/sync/refresh}" method="post" style="margin-bottom: 1rem;">
+        <button type="submit">Refresh from ../quran-data/sync-state.json</button>
+    </form>
+    <table>
+        <thead>
+            <tr><th>Resource</th><th>Status</th><th>Last sync at</th><th>Content version</th></tr>
+        </thead>
+        <tbody>
+            <tr th:each="s : ${syncStates}">
+                <td th:text="${s.resourceFilter}">-</td>
+                <td>
+                    <span class="badge"
+                          th:classappend="|badge-${s.status == 'success' ? 'ok' : (s.status == 'failed' ? 'fail' : 'never')}|"
+                          th:text="${s.status}">-</span>
+                </td>
+                <td th:text="${s.lastSyncAt}">-</td>
+                <td th:text="${s.contentVersion}">-</td>
+            </tr>
+            <tr th:if="${#lists.isEmpty(syncStates)}">
+                <td colspan="4" style="color: #6b7280;">No sync state rows yet. Click "Refresh" above to import from disk.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2>Raw JS-side sync-state.json</h2>
+    <pre th:text="${jsSyncState ?: 'File missing at ../quran-data/sync-state.json'}">-</pre>
+</body>
+</html>

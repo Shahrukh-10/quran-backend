@@ -1,0 +1,17 @@
+# Build outputs
+build/
+.gradle/
+bin/
+
+# H2 database files
+data/quran-h2*
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# OS
+.DS_Store
