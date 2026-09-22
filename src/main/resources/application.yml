@@ -1,21 +1,15 @@
 server:
-  port: 8080
+  port: ${SERVER_PORT:8080}
 
 spring:
-  datasource:
-    url: jdbc:h2:file:./data/quran-h2;AUTO_SERVER=TRUE
-    driver-class-name: org.h2.Driver
-    username: sa
-    password: ""
-  jpa:
-    hibernate:
-      ddl-auto: validate
-    properties:
-      hibernate:
-        dialect: org.hibernate.dialect.H2Dialect
-  flyway:
-    enabled: true
-    locations: classpath:db/migration
+  data:
+    mongodb:
+      # Production: injected via env (MONGODB_URI). Local dev falls back to inline creds.
+      # NEVER commit real prod credentials — the `admin:admin` fallback below is
+      # only useful in local dev when the env var is unset. In production,
+      # `/etc/default/qurandaily-backend` sets MONGODB_URI to the real URI.
+      uri: ${MONGODB_URI:mongodb+srv://admin:admin@cluster0.zfinwu5.mongodb.net/quranappdb?appName=Cluster0}
+      database: ${SPRING_DATA_MONGODB_DATABASE:quranappdb}
 
 management:
   endpoints:
@@ -25,7 +19,7 @@ management:
 
 logging:
   level:
-    com.islamicwebsite: DEBUG
+    com.islamicwebsite: ${LOG_LEVEL:INFO}
 
 springdoc:
   swagger-ui:
@@ -33,4 +27,4 @@ springdoc:
 
 quran:
   data:
-    root: ../quran-data
+    root: ${QURAN_DATA_ROOT:../quran-data}

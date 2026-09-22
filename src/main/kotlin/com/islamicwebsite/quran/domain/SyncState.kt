@@ -1,17 +1,16 @@
 package com.islamicwebsite.quran.domain
 
-import jakarta.persistence.*
+import org.springframework.data.annotation.Id
+import org.springframework.data.mongodb.core.mapping.Document
 import java.time.Instant
 
-@Entity
-@Table(name = "qc_sync_state")
+@Document(collection = "qc_sync_state")
 class SyncState(
-    @Id
-    @Column(name = "resource_filter") var resourceFilter: String = "",
-    @Column(name = "sync_token") var syncToken: String? = null,
-    @Column(name = "status") var status: String = "",
-    @Column(name = "last_sync_at") var lastSyncAt: Instant? = null,
-    @Column(name = "last_attempt_at") var lastAttemptAt: Instant? = null,
-    @Column(name = "error_message", columnDefinition = "CLOB") var errorMessage: String? = null,
-    @Column(name = "content_version", nullable = false) var contentVersion: Int = 0
+    @Id var resourceFilter: String = "",
+    var syncToken: String? = null,
+    var status: String = "",
+    var lastSyncAt: Instant? = null,
+    var lastAttemptAt: Instant? = null,
+    var errorMessage: String? = null,
+    var contentVersion: Int = 0
 )

@@ -2,35 +2,49 @@ package com.islamicwebsite.quran.sync
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ArrayNode
-import com.islamicwebsite.quran.repo.ChapterRepository
-import com.islamicwebsite.quran.repo.RecitationRepository
-import com.islamicwebsite.quran.repo.TafsirRepository
-import com.islamicwebsite.quran.repo.TranslationRepository
-import com.islamicwebsite.quran.repo.VerseRepository
+import com.islamicwebsite.quran.domain.*
+import com.islamicwebsite.quran.repo.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.context.event.ApplicationReadyEvent
 import org.springframework.context.event.EventListener
-import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.data.mongodb.core.MongoTemplate
 import org.springframework.stereotype.Component
-import org.springframework.transaction.annotation.Transactional
 import java.io.File
+import java.util.concurrent.atomic.AtomicLong
 
+/**
+ * Seeds the constant Quran corpus (chapters, verses, words, translations,
+ * tafsirs, recitations, audio timings, chapter recitations) into MongoDB
+ * on first startup from the local ../quran-data JSON tree.
+ *
+ * Idempotent: if `qc_chapter` already holds 114 documents, we skip every
+ * step. Otherwise we insert in bulk via MongoTemplate.insert(collection)
+ * — the fastest path Spring Data exposes for large seed loads.
+ *
+ * Long-id documents (Word) are assigned a monotonically increasing id
+ * inside this JVM before insertion since MongoDB does not generate Long ids.
+ */
 @Component
 class BootstrapImporter(
-    private val jdbc: JdbcTemplate,
+    private val mongo: MongoTemplate,
     private val chapterRepo: ChapterRepository,
     private val verseRepo: VerseRepository,
+    private val wordRepo: WordRepository,
     private val translationRepo: TranslationRepository,
+    private val translationVerseRepo: TranslationVerseRepository,
     private val tafsirRepo: TafsirRepository,
+    private val tafsirVerseRepo: TafsirVerseRepository,
     private val recitationRepo: RecitationRepository,
+    private val ayahRecitationRepo: AyahRecitationRepository,
+    private val chapterRecitationRepo: ChapterRecitationRepository,
     @Value("\${quran.data.root:../quran-data}") private val dataRoot: String,
 ) {
     private val log = LoggerFactory.getLogger(BootstrapImporter::class.java)
     private val mapper = ObjectMapper()
+    private val wordIdSeq = AtomicLong(0)
 
     @EventListener(ApplicationReadyEvent::class)
-    @Transactional
     fun run() {
         val root = File(dataRoot).absoluteFile
         if (!root.exists()) {
@@ -43,6 +57,8 @@ class BootstrapImporter(
         if (existingChapters >= 114L) {
             log.info("Chapters already imported ({}) — skipping", existingChapters)
         } else {
+            // seed word-id sequence past any pre-existing rows so re-runs don't collide
+            wordIdSeq.set(wordRepo.count() + 1)
             importChapters(File(root, "chapters.json"))
             importVerses(File(root, "verses"))
             importRecitations(File(root, "recitations.json"))
@@ -59,218 +75,246 @@ class BootstrapImporter(
     }
 
     private fun importChapters(file: File) {
+        if (!file.exists()) { log.warn("chapters.json missing: {}", file); return }
         val arr = mapper.readTree(file) as ArrayNode
-        val sql = "INSERT INTO qc_chapter (id, revelation_place, revelation_order, bismillah_pre, name_simple, name_complex, name_arabic, verses_count, page_start, page_end, translated_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        val batch = arr.map { row ->
+        val docs = arr.map { row ->
             val pages = row.get("pages") as ArrayNode
-            arrayOf<Any?>(
-                row.get("id").asInt(),
-                row.get("revelation_place").asText(),
-                row.get("revelation_order").asInt(),
-                row.get("bismillah_pre").asBoolean(),
-                row.get("name_simple").asText(),
-                row.get("name_complex").asText(),
-                row.get("name_arabic").asText(),
-                row.get("verses_count").asInt(),
-                pages.get(0).asInt(),
-                pages.get(1).asInt(),
-                row.get("translated_name")?.get("name")?.asText() ?: "",
+            Chapter(
+                id = row.get("id").asInt(),
+                revelationPlace = row.get("revelation_place").asText(),
+                revelationOrder = row.get("revelation_order").asInt(),
+                bismillahPre = row.get("bismillah_pre").asBoolean(),
+                nameSimple = row.get("name_simple").asText(),
+                nameComplex = row.get("name_complex").asText(),
+                nameArabic = row.get("name_arabic").asText(),
+                versesCount = row.get("verses_count").asInt(),
+                pageStart = pages.get(0).asInt(),
+                pageEnd = pages.get(1).asInt(),
+                translatedName = row.get("translated_name")?.get("name")?.asText() ?: "",
             )
         }
-        jdbc.batchUpdate(sql, batch)
-        log.info("Imported {} chapters", batch.size)
+        mongo.insert(docs, Chapter::class.java)
+        log.info("Imported {} chapters", docs.size)
     }
 
     private fun importVerses(dir: File) {
-        val verseSql = "INSERT INTO qc_verse (verse_key, chapter_id, verse_number, juz_number, hizb_number, rub_el_hizb_number, ruku_number, manzil_number, page_number, sajdah_number, text_uthmani, text_indopak, text_imlaei) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        val wordSql = "INSERT INTO qc_word (verse_key, position, char_type_name, text_uthmani, text_indopak, translation, transliteration, audio_relative_url, page_number, line_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        if (!dir.exists()) { log.warn("verses/ dir missing: {}", dir); return }
         var verseCount = 0L
         var wordCount = 0L
-        val verseBatch = mutableListOf<Array<Any?>>()
-        val wordBatch = mutableListOf<Array<Any?>>()
+        val verseBatch = mutableListOf<Verse>()
+        val wordBatch = mutableListOf<Word>()
+
+        fun flushVerses() {
+            if (verseBatch.isNotEmpty()) {
+                mongo.insert(verseBatch, Verse::class.java)
+                verseCount += verseBatch.size
+                verseBatch.clear()
+            }
+        }
+
+        fun flushWords() {
+            if (wordBatch.isNotEmpty()) {
+                mongo.insert(wordBatch, Word::class.java)
+                wordCount += wordBatch.size
+                wordBatch.clear()
+            }
+        }
+
         for (s in 1..114) {
             val file = File(dir, "$s.json")
             if (!file.exists()) continue
             val arr = mapper.readTree(file) as ArrayNode
             for (v in arr) {
-                verseBatch += arrayOf(
-                    v.get("verse_key").asText(),
-                    s,
-                    v.get("verse_number").asInt(),
-                    v.get("juz_number").asInt(),
-                    v.get("hizb_number").asInt(),
-                    v.get("rub_el_hizb_number")?.takeUnless { it.isNull }?.asInt(),
-                    v.get("ruku_number").asInt(),
-                    v.get("manzil_number").asInt(),
-                    v.get("page_number").asInt(),
-                    v.get("sajdah_number")?.takeUnless { it.isNull }?.asInt(),
-                    v.get("text_uthmani").asText(),
-                    v.get("text_indopak")?.takeUnless { it.isNull }?.asText(),
-                    v.get("text_imlaei")?.takeUnless { it.isNull }?.asText(),
+                verseBatch += Verse(
+                    verseKey = v.get("verse_key").asText(),
+                    chapterId = s,
+                    verseNumber = v.get("verse_number").asInt(),
+                    juzNumber = v.get("juz_number").asInt(),
+                    hizbNumber = v.get("hizb_number").asInt(),
+                    rubElHizbNumber = v.get("rub_el_hizb_number")?.takeUnless { it.isNull }?.asInt(),
+                    rukuNumber = v.get("ruku_number").asInt(),
+                    manzilNumber = v.get("manzil_number").asInt(),
+                    pageNumber = v.get("page_number").asInt(),
+                    sajdahNumber = v.get("sajdah_number")?.takeUnless { it.isNull }?.asInt(),
+                    textUthmani = v.get("text_uthmani").asText(),
+                    textIndopak = v.get("text_indopak")?.takeUnless { it.isNull }?.asText(),
+                    textImlaei = v.get("text_imlaei")?.takeUnless { it.isNull }?.asText(),
                 )
                 val words = v.get("words") as? ArrayNode
                 if (words != null) {
                     for (w in words) {
-                        wordBatch += arrayOf(
-                            v.get("verse_key").asText(),
-                            w.get("position").asInt(),
-                            w.get("char_type_name").asText(),
-                            w.get("text_uthmani").asText(),
-                            w.get("text_indopak")?.takeUnless { it.isNull }?.asText(),
-                            w.get("translation")?.get("text")?.asText(),
-                            w.get("transliteration")?.get("text")?.asText(),
-                            w.get("audio_url")?.takeUnless { it.isNull }?.asText(),
-                            w.get("page_number").asInt(),
-                            w.get("line_number").asInt(),
+                        wordBatch += Word(
+                            id = wordIdSeq.getAndIncrement(),
+                            verseKey = v.get("verse_key").asText(),
+                            position = w.get("position").asInt(),
+                            charTypeName = w.get("char_type_name").asText(),
+                            textUthmani = w.get("text_uthmani").asText(),
+                            textIndopak = w.get("text_indopak")?.takeUnless { it.isNull }?.asText(),
+                            translation = w.get("translation")?.get("text")?.asText(),
+                            transliteration = w.get("transliteration")?.get("text")?.asText(),
+                            audioRelativeUrl = w.get("audio_url")?.takeUnless { it.isNull }?.asText(),
+                            pageNumber = w.get("page_number").asInt(),
+                            lineNumber = w.get("line_number").asInt(),
                         )
                     }
                 }
-                // Word rows FK to qc_verse.verse_key, so we must flush verses before words.
                 if (wordBatch.size >= 1000) {
-                    if (verseBatch.isNotEmpty()) {
-                        jdbc.batchUpdate(verseSql, verseBatch); verseCount += verseBatch.size; verseBatch.clear()
-                    }
-                    jdbc.batchUpdate(wordSql, wordBatch); wordCount += wordBatch.size; wordBatch.clear()
+                    flushVerses(); flushWords()
                 } else if (verseBatch.size >= 500) {
-                    jdbc.batchUpdate(verseSql, verseBatch); verseCount += verseBatch.size; verseBatch.clear()
+                    flushVerses()
                 }
             }
         }
-        if (verseBatch.isNotEmpty()) {
-            jdbc.batchUpdate(verseSql, verseBatch); verseCount += verseBatch.size; verseBatch.clear()
-        }
-        if (wordBatch.isNotEmpty()) {
-            jdbc.batchUpdate(wordSql, wordBatch); wordCount += wordBatch.size; wordBatch.clear()
-        }
+        flushVerses()
+        flushWords()
         log.info("Imported {} verses, {} words", verseCount, wordCount)
     }
 
     private fun importRecitations(file: File) {
         if (!file.exists()) return
         val arr = mapper.readTree(file) as ArrayNode
-        val sql = "INSERT INTO qc_recitation (id, reciter_name, style) VALUES (?, ?, ?)"
-        val batch = arr.map { row ->
-            arrayOf<Any?>(
-                row.get("id").asInt(),
-                row.get("reciter_name").asText(),
-                row.get("style")?.takeUnless { it.isNull }?.asText(),
+        val docs = arr.map { row ->
+            Recitation(
+                id = row.get("id").asInt(),
+                reciterName = row.get("reciter_name").asText(),
+                style = row.get("style")?.takeUnless { it.isNull }?.asText(),
             )
         }
-        jdbc.batchUpdate(sql, batch)
-        log.info("Imported {} recitations", batch.size)
+        mongo.insert(docs, Recitation::class.java)
+        log.info("Imported {} recitations", docs.size)
     }
 
     private fun importTranslations(catalogFile: File, dir: File) {
+        if (!catalogFile.exists() || !dir.exists()) return
         val catalog = mapper.readTree(catalogFile) as ArrayNode
         val syncedIds = dir.listFiles { f -> f.isDirectory && f.name.matches(Regex("\\d+")) }
             ?.map { it.name.toInt() }?.toSet() ?: emptySet()
-        val catSql = "INSERT INTO qc_translation (id, name, author_name, slug, language_name) VALUES (?, ?, ?, ?, ?)"
-        for (t in catalog) {
+
+        val catalogDocs = catalog.mapNotNull { t ->
             val id = t.get("id").asInt()
-            if (id !in syncedIds) continue
-            jdbc.update(
-                catSql, id, t.get("name").asText(), t.get("author_name").asText(),
-                t.get("slug").asText(), t.get("language_name").asText()
+            if (id !in syncedIds) null else Translation(
+                id = id,
+                name = t.get("name").asText(),
+                authorName = t.get("author_name").asText(),
+                slug = t.get("slug").asText(),
+                languageName = t.get("language_name").asText(),
             )
         }
+        if (catalogDocs.isNotEmpty()) mongo.insert(catalogDocs, Translation::class.java)
 
-        val rowSql = "INSERT INTO qc_translation_verse (translation_id, verse_key, text) VALUES (?, ?, ?)"
         for (id in syncedIds) {
-            val batch = mutableListOf<Array<Any?>>()
+            val batch = mutableListOf<TranslationVerse>()
             var total = 0L
             for (s in 1..114) {
                 val f = File(dir, "$id/$s.json"); if (!f.exists()) continue
                 val rows = mapper.readTree(f) as ArrayNode
-                for (r in rows) batch += arrayOf(id, r.get("verse_key").asText(), r.get("text").asText())
+                for (r in rows) {
+                    batch += TranslationVerse(
+                        key = TranslationVerseKey(translationId = id, verseKey = r.get("verse_key").asText()),
+                        text = r.get("text").asText(),
+                    )
+                }
                 if (batch.size >= 2000) {
-                    jdbc.batchUpdate(rowSql, batch); total += batch.size; batch.clear()
+                    mongo.insert(batch, TranslationVerse::class.java)
+                    total += batch.size; batch.clear()
                 }
             }
             if (batch.isNotEmpty()) {
-                jdbc.batchUpdate(rowSql, batch); total += batch.size
+                mongo.insert(batch, TranslationVerse::class.java)
+                total += batch.size
             }
             log.info("Imported translation {} ({} rows)", id, total)
         }
     }
 
     private fun importTafsirs(catalogFile: File, dir: File) {
+        if (!catalogFile.exists() || !dir.exists()) return
         val catalog = mapper.readTree(catalogFile) as ArrayNode
         val syncedIds = dir.listFiles { f -> f.isDirectory && f.name.matches(Regex("\\d+")) }
             ?.map { it.name.toInt() }?.toSet() ?: emptySet()
-        val catSql = "INSERT INTO qc_tafsir (id, name, author_name, slug, language_name) VALUES (?, ?, ?, ?, ?)"
-        for (t in catalog) {
+
+        val catalogDocs = catalog.mapNotNull { t ->
             val id = t.get("id").asInt()
-            if (id !in syncedIds) continue
-            jdbc.update(
-                catSql, id, t.get("name").asText(), t.get("author_name").asText(),
-                t.get("slug").asText(), t.get("language_name").asText()
+            if (id !in syncedIds) null else Tafsir(
+                id = id,
+                name = t.get("name").asText(),
+                authorName = t.get("author_name").asText(),
+                slug = t.get("slug").asText(),
+                languageName = t.get("language_name").asText(),
             )
         }
+        if (catalogDocs.isNotEmpty()) mongo.insert(catalogDocs, Tafsir::class.java)
 
-        val rowSql = "INSERT INTO qc_tafsir_verse (tafsir_id, verse_key, text) VALUES (?, ?, ?)"
         for (id in syncedIds) {
-            val batch = mutableListOf<Array<Any?>>()
+            val batch = mutableListOf<TafsirVerse>()
             var total = 0L
             for (s in 1..114) {
                 val f = File(dir, "$id/$s.json"); if (!f.exists()) continue
                 val rows = mapper.readTree(f) as ArrayNode
-                for (r in rows) batch += arrayOf(id, r.get("verse_key").asText(), r.get("text").asText())
+                for (r in rows) {
+                    batch += TafsirVerse(
+                        key = TafsirVerseKey(tafsirId = id, verseKey = r.get("verse_key").asText()),
+                        text = r.get("text").asText(),
+                    )
+                }
                 if (batch.size >= 500) {
-                    jdbc.batchUpdate(rowSql, batch); total += batch.size; batch.clear()
+                    mongo.insert(batch, TafsirVerse::class.java)
+                    total += batch.size; batch.clear()
                 }
             }
             if (batch.isNotEmpty()) {
-                jdbc.batchUpdate(rowSql, batch); total += batch.size
+                mongo.insert(batch, TafsirVerse::class.java)
+                total += batch.size
             }
             log.info("Imported tafsir {} ({} rows)", id, total)
         }
     }
 
     private fun importAudioTimings(dir: File) {
-        val sql = "INSERT INTO qc_ayah_recitation (recitation_id, verse_key, audio_url, segments) VALUES (?, ?, ?, ?)"
+        if (!dir.exists()) return
         val reciters = dir.listFiles { f -> f.isDirectory && f.name.matches(Regex("\\d+")) } ?: return
         for (rDir in reciters) {
             val rId = rDir.name.toInt()
-            val batch = mutableListOf<Array<Any?>>()
+            val batch = mutableListOf<AyahRecitation>()
             var total = 0L
             for (s in 1..114) {
                 val f = File(rDir, "$s.json"); if (!f.exists()) continue
                 val rows = mapper.readTree(f) as ArrayNode
                 for (row in rows) {
                     val url = row.get("audio_url")?.takeUnless { it.isNull }?.asText() ?: continue
-                    batch += arrayOf(
-                        rId,
-                        row.get("verse_key").asText(),
-                        url,
-                        mapper.writeValueAsString(row.get("segments")),
+                    batch += AyahRecitation(
+                        key = AyahRecitationKey(recitationId = rId, verseKey = row.get("verse_key").asText()),
+                        audioUrl = url,
+                        segmentsJson = mapper.writeValueAsString(row.get("segments")),
                     )
                 }
                 if (batch.size >= 2000) {
-                    jdbc.batchUpdate(sql, batch); total += batch.size; batch.clear()
+                    mongo.insert(batch, AyahRecitation::class.java)
+                    total += batch.size; batch.clear()
                 }
             }
             if (batch.isNotEmpty()) {
-                jdbc.batchUpdate(sql, batch); total += batch.size
+                mongo.insert(batch, AyahRecitation::class.java)
+                total += batch.size
             }
             log.info("Imported audio timings for reciter {} ({} rows)", rId, total)
         }
     }
 
     private fun importChapterRecitations(dir: File) {
-        val sql = "INSERT INTO qc_chapter_recitation (recitation_id, chapter_id, audio_url, file_size) VALUES (?, ?, ?, ?)"
+        if (!dir.exists()) return
         val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".json") } ?: return
         for (f in files) {
             val rId = f.nameWithoutExtension.toInt()
             val arr = mapper.readTree(f) as ArrayNode
-            val batch = arr.map { row ->
-                arrayOf<Any?>(
-                    rId,
-                    row.get("chapter_id").asInt(),
-                    row.get("audio_url").asText(),
-                    row.get("file_size").asLong(),
+            val docs = arr.map { row ->
+                ChapterRecitation(
+                    key = ChapterRecitationKey(recitationId = rId, chapterId = row.get("chapter_id").asInt()),
+                    audioUrl = row.get("audio_url").asText(),
+                    fileSize = row.get("file_size").asLong(),
                 )
             }
-            jdbc.batchUpdate(sql, batch)
+            if (docs.isNotEmpty()) mongo.insert(docs, ChapterRecitation::class.java)
         }
         log.info("Imported chapter recitations from {} files", files.size)
     }

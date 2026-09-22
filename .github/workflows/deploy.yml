@@ -1,0 +1,88 @@
+name: Deploy backend to Qurandaily VPS
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.gitignore'
+      - 'README.md'
+      - '**/*.md'
+  workflow_dispatch: {}
+
+concurrency:
+  group: qurandaily-backend-deploy
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Build JAR
+        run: |
+          chmod +x ./gradlew
+          ./gradlew clean bootJar -x test --no-daemon --console=plain
+          ls -la build/libs/
+
+      - name: Upload JAR to VPS staging
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.QURANDAILY_DEPLOY_HOST }}
+          username: root
+          key: ${{ secrets.QURANDAILY_DEPLOY_SSH_KEY }}
+          source: "build/libs/quran-backend-*-SNAPSHOT.jar"
+          target: "/tmp/"
+          strip_components: 2
+
+      - name: Swap + restart qurandaily-backend service
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.QURANDAILY_DEPLOY_HOST }}
+          username: root
+          key: ${{ secrets.QURANDAILY_DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            # Find the uploaded JAR
+            STAGING_JAR=$(ls -t /tmp/quran-backend-*-SNAPSHOT.jar | head -1)
+            if [ -z "$STAGING_JAR" ]; then
+              echo "No staged JAR found in /tmp/"; exit 1
+            fi
+            echo "Staged: $STAGING_JAR"
+            ls -la "$STAGING_JAR"
+            # Backup current + swap
+            mkdir -p /opt/qurandaily-backend/backups
+            [ -f /opt/qurandaily-backend/current/app.jar ] && \
+              cp /opt/qurandaily-backend/current/app.jar \
+                 /opt/qurandaily-backend/backups/app.$(date +%Y%m%d-%H%M%S).jar
+            cp "$STAGING_JAR" /opt/qurandaily-backend/current/app.jar
+            # Restart
+            systemctl restart qurandaily-backend
+            # Wait for it to be up
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+              if curl -sf -o /dev/null http://127.0.0.1:8090/actuator/health; then
+                echo "Backend healthy after ${i}s wait"
+                break
+              fi
+              sleep 2
+            done
+            # Final check + public URL check
+            curl -sf http://127.0.0.1:8090/actuator/health || (echo "LOCAL HEALTH FAILED"; systemctl status qurandaily-backend --no-pager; exit 1)
+            curl -sf https://api.qurandaily.org/actuator/health || echo "PUBLIC HEALTH WARN"
+            # Purge CF cache for api hostname only (host-scoped, doesn't affect anything else)
+            if [ -n "${{ secrets.QURANDAILY_CF_TOKEN }}" ] && [ -n "${{ secrets.QURANDAILY_CF_ZONE_ID }}" ]; then
+              curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.QURANDAILY_CF_ZONE_ID }}/purge_cache" \
+                -H "Authorization: Bearer ${{ secrets.QURANDAILY_CF_TOKEN }}" \
+                -H "Content-Type: application/json" \
+                -d '{"hosts":["api.qurandaily.org"]}' | head -c 200; echo
+            fi
+            rm -f "$STAGING_JAR"
+            echo "Backend deploy complete."
